@@ -275,5 +275,92 @@ class TestPathValidator:
             "Exclude pattern should filter out matching files"
 
 
+    async def test_path_traversal_attacks(self, secure_filesystem):
+        """Test various path traversal attack vectors."""
+        # Arrange
+        fs = secure_filesystem
+        validator = PathValidator([str(fs["allowed_dir1"])])
+
+        # Path traversal attack vectors
+        attack_vectors = [
+            # Basic traversal attempts
+            "../../../etc/passwd",
+            "..\\..\\..\\windows\\system32",
+            "....//....//....//etc/passwd",
+            "/var/log/../../../etc/passwd",
+
+            # URL encoded traversal attempts
+            "%2e%2e%2f%2e%2e%2f%2e%2e%2fetc%2fpasswd",
+            "%2e%2e%5c%2e%2e%5c%2e%2e%5cwindows%5csystem32",
+            "..%2f..%2f..%2fetc%2fpasswd",
+            "..%5c..%5c..%5cwindows%5csystem32",
+
+            # Double URL encoded
+            "%252e%252e%252f%252e%252e%252f%252e%252e%252fetc%252fpasswd",
+
+            # Mixed encoding
+            "%2e%2e/../../etc/passwd",
+            "..%2f../../../etc/passwd",
+
+            # Null byte injection
+            "../../../etc/passwd\x00.txt",
+            "..\\..\\..\\windows\\system32\x00.exe",
+
+            # Unicode normalization attacks
+            "\u002e\u002e\u002f\u002e\u002e\u002f\u002e\u002e\u002fetc\u002fpasswd",
+
+            # Long path attacks
+            "../" * 1000 + "etc/passwd",
+
+            # Absolute path escapes
+            "/etc/passwd",
+            "C:\\Windows\\System32\\config\\SAM",
+
+            # Mixed separators
+            "..\\/../../../etc/passwd",
+            "../\\..\\/../etc/passwd",
+        ]
+
+        # Act & Assert
+        for attack_vector in attack_vectors:
+            result_path, allowed = await validator.validate_path(attack_vector)
+            assert allowed is False, f"Path traversal attack should be blocked: {attack_vector}"
+
+    async def test_encoding_bypass_attacks(self, secure_filesystem):
+        """Test encoding bypass attack vectors."""
+        # Arrange
+        fs = secure_filesystem
+        validator = PathValidator([str(fs["allowed_dir1"])])
+
+        # Encoding bypass vectors
+        encoding_attacks = [
+            # URL encoding variations
+            "%2e%2e%2f",  # ../
+            "%2e%2e%5c",  # ..\
+            "%252e%252e%252f",  # Double encoded ../
+            "%c0%ae%c0%ae%c0%af",  # Overlong UTF-8 encoding
+            "%e0%80%ae%e0%80%ae%e0%80%af",  # Another overlong encoding
+
+            # Unicode variations
+            "\u002e\u002e\u002f",  # Unicode ../
+            "\uff0e\uff0e\uff0f",  # Fullwidth ../
+
+            # Mixed case (for case-insensitive systems)
+            "..%2F",
+            "..%5C",
+        ]
+
+        # Act & Assert
+        for attack in encoding_attacks:
+            # Test the attack vector directly
+            result_path, allowed = await validator.validate_path(attack + "etc/passwd")
+            assert allowed is False, f"Encoding bypass should be blocked: {attack}"
+
+            # Test with legitimate path prefix
+            combined_attack = str(fs["allowed_dir1"]) + "/" + attack + "../../../etc/passwd"
+            result_path, allowed = await validator.validate_path(combined_attack)
+            assert allowed is False, f"Combined encoding attack should be blocked: {combined_attack}"
+
+
 if __name__ == "__main__":
     pytest.main(["-xvs", __file__])
