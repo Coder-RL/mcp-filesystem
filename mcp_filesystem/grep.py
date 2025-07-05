@@ -7,6 +7,8 @@ with ripgrep integration when available and a Python fallback.
 import json
 import re
 import subprocess
+import asyncio
+import signal
 from functools import partial  # Added for mypy compatibility with run_sync
 from pathlib import Path
 from typing import Dict, List, Optional, Union, Callable, Any
@@ -17,6 +19,11 @@ from mcp.server.fastmcp.utilities.logging import get_logger
 from .security import PathValidator
 
 logger = get_logger(__name__)
+
+# SECURITY: Regex execution timeout in seconds
+REGEX_TIMEOUT_SECONDS = 5
+# SECURITY: Maximum regex pattern length to prevent ReDoS
+MAX_REGEX_LENGTH = 1000
 
 
 class GrepMatch:
@@ -102,24 +109,20 @@ class GrepResult:
         else:
             self.file_counts[match.file_path] = 1
 
-    def add_file_error(self, file_path: str, error: str) -> None:
-        """Add a file error to the results.
+    def add_error(self, file_path: str, error: str) -> None:
+        """Add an error for a file.
 
         Args:
-            file_path: Path to the file with the error
+            file_path: Path to the file with error
             error: Error message
         """
         self.errors[file_path] = error
-
-    def increment_files_searched(self) -> None:
-        """Increment the count of files searched."""
-        self.files_searched += 1
 
     def to_dict(self) -> Dict:
         """Convert to dictionary representation.
 
         Returns:
-            Dictionary with all results
+            Dictionary with search results
         """
         return {
             "matches": [match.to_dict() for match in self.matches],
@@ -129,96 +132,9 @@ class GrepResult:
             "errors": self.errors,
         }
 
-    def format_text(
-        self,
-        show_line_numbers: bool = True,
-        show_file_names: bool = True,
-        count_only: bool = False,
-        show_context: bool = True,
-        highlight: bool = True,
-    ) -> str:
-        """Format results as text.
-
-        Args:
-            show_line_numbers: Include line numbers in output
-            show_file_names: Include file names in output
-            count_only: Only show match counts per file
-            show_context: Show context lines if available
-            highlight: Highlight matches
-
-        Returns:
-            Formatted string with results
-        """
-        if count_only:
-            lines = [
-                f"Found {self.total_matches} matches in {len(self.file_counts)} files:"
-            ]
-            for file_path, count in sorted(self.file_counts.items()):
-                lines.append(f"{file_path}: {count} matches")
-            return "\n".join(lines)
-
-        if not self.matches:
-            return "No matches found"
-
-        lines = []
-        current_file = None
-
-        for match in self.matches:
-            # Add file header if changed
-            if show_file_names and match.file_path != current_file:
-                current_file = match.file_path
-                lines.append(f"\n{current_file}:")
-
-            # Add context before
-            if show_context and match.context_before:
-                for i, context in enumerate(match.context_before):
-                    context_line_num = match.line_number - len(match.context_before) + i
-                    if show_line_numbers:
-                        lines.append(f"{context_line_num:>6}: {context}")
-                    else:
-                        lines.append(f"{context}")
-
-            # Add matching line
-            line_prefix = ""
-            if show_line_numbers:
-                line_prefix = f"{match.line_number:>6}: "
-
-            if highlight:
-                # Highlight the match in the line
-                line = match.line_content
-                highlighted = (
-                    line[: match.match_start]
-                    + ">>>"
-                    + line[match.match_start : match.match_end]
-                    + "<<<"
-                    + line[match.match_end :]
-                )
-                lines.append(f"{line_prefix}{highlighted}")
-            else:
-                lines.append(f"{line_prefix}{match.line_content}")
-
-            # Add context after
-            if show_context and match.context_after:
-                for i, context in enumerate(match.context_after):
-                    context_line_num = match.line_number + i + 1
-                    if show_line_numbers:
-                        lines.append(f"{context_line_num:>6}: {context}")
-                    else:
-                        lines.append(f"{context}")
-
-        # Add summary
-        summary = (
-            f"\nFound {self.total_matches} matches in {len(self.file_counts)} files"
-        )
-        if self.errors:
-            summary += f" ({len(self.errors)} files had errors)"
-        lines.append(summary)
-
-        return "\n".join(lines)
-
 
 class GrepTools:
-    """Enhanced grep functionality with ripgrep integration."""
+    """Provides grep-like functionality for searching text in files."""
 
     def __init__(self, validator: PathValidator):
         """Initialize with a path validator.
@@ -230,23 +146,44 @@ class GrepTools:
         self._ripgrep_available = self._check_ripgrep()
 
     def _check_ripgrep(self) -> bool:
-        """Check if ripgrep is available.
+        """Check if ripgrep is available on the system.
 
         Returns:
             True if ripgrep is available, False otherwise
         """
         try:
             subprocess.run(
-                ["rg", "--version"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=True,
+                ["rg", "--version"], capture_output=True, check=True, timeout=5
             )
-            logger.info("Ripgrep is available")
             return True
-        except (subprocess.SubprocessError, FileNotFoundError):
-            logger.info("Ripgrep not found, using Python fallback")
+        except (subprocess.SubprocessError, FileNotFoundError, subprocess.TimeoutExpired):
             return False
+
+    def _sanitize_ripgrep_pattern(self, pattern: str) -> str:
+        """Sanitize pattern for safe use with ripgrep to prevent command injection.
+        
+        Args:
+            pattern: User input pattern to sanitize
+            
+        Returns:
+            Sanitized pattern safe for use with ripgrep
+        """
+        # Block dangerous characters that could be used for command injection
+        dangerous_chars = [';', '&', '|', '`', '$', '(', ')', '<', '>', '\n', '\r']
+        
+        for char in dangerous_chars:
+            if char in pattern:
+                raise ValueError(f"Pattern contains dangerous character: {char}")
+        
+        # Limit pattern length to prevent buffer overflow
+        if len(pattern) > 1000:
+            raise ValueError("Pattern too long (max 1000 characters)")
+            
+        # Additional validation for shell metacharacters
+        if any(metachar in pattern for metachar in ['&&', '||', '>>', '<<']):
+            raise ValueError("Pattern contains shell metacharacters")
+            
+        return pattern
 
     async def grep_files(
         self,
@@ -261,7 +198,7 @@ class GrepTools:
         context_before: int = 0,
         context_after: int = 0,
         max_results: int = 1000,
-        max_file_size_mb: float = 10,
+        max_file_size_mb: float = 50.0,
         recursive: bool = True,
         max_depth: Optional[int] = None,
         count_only: bool = False,
@@ -376,52 +313,54 @@ class GrepTools:
             GrepResult with matches
 
         Raises:
-            RuntimeError: If ripgrep fails
+            RuntimeError: If ripgrep execution fails
         """
         # Build ripgrep command
-        cmd = ["rg"]
+        cmd = ["rg", "--json"]
 
-        # Basic options
-        cmd.append("--json")  # JSON output for parsing
-
-        if not is_regex:
-            cmd.append("--fixed-strings")
-
+        # Case sensitivity
         if not case_sensitive:
             cmd.append("--ignore-case")
 
+        # Regex mode
+        if not is_regex:
+            cmd.append("--fixed-strings")
+
+        # Word boundary
         if whole_word:
             cmd.append("--word-regexp")
 
-        # Apply context options (priority: specific before/after over general context)
-        if context_before > 0:
-            cmd.extend(["--before-context", str(context_before)])
-
-        if context_after > 0:
-            cmd.extend(["--after-context", str(context_after)])
-
-        # Only use general context if specific before/after not provided
-        elif context_lines > 0 and context_before == 0 and context_after == 0:
+        # Context lines
+        if context_lines > 0:
             cmd.extend(["--context", str(context_lines)])
+        else:
+            if context_before > 0:
+                cmd.extend(["--before-context", str(context_before)])
+            if context_after > 0:
+                cmd.extend(["--after-context", str(context_after)])
 
+        # Recursion
         if not recursive:
-            cmd.append("--no-recursive")
-
-        if max_depth is not None:
+            cmd.append("--max-depth=1")
+        elif max_depth is not None:
             cmd.extend(["--max-depth", str(max_depth)])
 
-        # Include/exclude patterns
+        # Result limits
+        if max_results > 0:
+            cmd.extend(["--max-count", str(max_results)])
+
+        # Include patterns
         if include_patterns:
             for pattern_glob in include_patterns:
                 cmd.extend(["--glob", pattern_glob])
 
+        # Exclude patterns
         if exclude_patterns:
             for pattern_glob in exclude_patterns:
                 cmd.extend(["--glob", f"!{pattern_glob}"])
 
         # Add pattern and path
         cmd.append(pattern)
-        cmd.append(str(path))
 
         # Run ripgrep
         result = GrepResult()
@@ -525,9 +464,6 @@ class GrepTools:
 
                             result.add_match(match)
 
-                            if len(result.matches) >= max_results:
-                                return result
-
                     elif match_type == "context" and current_file_path:
                         # Context line
                         context_data = data.get("data", {})
@@ -536,31 +472,36 @@ class GrepTools:
                             context_data.get("lines", {}).get("text", "").rstrip("\n")
                         )
 
-                        # Store context line
-                        line_context[line_number] = line_content
-
-                        # Check if this is context after a match and update it
-                        for match in reversed(result.matches):
-                            if (
-                                match.file_path == current_file_path
-                                and match.line_number < line_number
-                            ):
-                                if line_number <= match.line_number + context_lines:
-                                    match.context_after.append(line_content)
-                                break
-
-                    elif match_type == "end" and current_file_path:
-                        # End of file
-                        current_file = None
-                        current_file_path = None
-                        line_context.clear()
-                        result.increment_files_searched()
+                        # Store for potential use in match context
+                        if line_number not in line_context:
+                            line_context[line_number] = []
+                        line_context[line_number].append(line_content)
 
                 except json.JSONDecodeError:
-                    # Skip invalid JSON
+                    # Skip invalid JSON lines
                     continue
-                except Exception as e:
-                    logger.warning(f"Error processing ripgrep output: {e}")
+
+            # Apply pagination if requested
+            if results_offset > 0 or results_limit is not None:
+                paginated_result = GrepResult()
+                paginated_result.file_counts = result.file_counts
+                paginated_result.total_matches = result.total_matches
+                paginated_result.files_searched = result.files_searched
+                paginated_result.errors = result.errors
+
+                # Apply offset and limit
+                start_idx = min(results_offset, len(result.matches))
+
+                if results_limit is not None:
+                    end_idx = min(start_idx + results_limit, len(result.matches))
+                else:
+                    end_idx = len(result.matches)
+
+                # Copy only the matches in the requested range
+                paginated_result.matches = result.matches[start_idx:end_idx]
+
+                # Return the paginated result
+                return paginated_result
 
             return result
 
@@ -602,6 +543,9 @@ class GrepTools:
 
         # Compile regex pattern
         if is_regex:
+            # SECURITY: Validate regex pattern to prevent ReDoS attacks
+            self._validate_regex_security(pattern)
+            
             flags = 0 if case_sensitive else re.IGNORECASE
             try:
                 if whole_word:
@@ -728,216 +672,177 @@ class GrepTools:
                 # Skip directories we can't access
                 pass
 
-        # Process each file
+        # Search files
         total_files = len(files_to_search)
+        processed = 0
 
-        for i, file_path in enumerate(files_to_search):
-            if show_progress and progress_callback:
-                await progress_callback(i, total_files)
+        for file_path in files_to_search:
+            if result.total_matches >= max_results:
+                break
 
             try:
-                # Skip files that are too large
-                file_size = file_path.stat().st_size
-                if file_size > max_file_size:
-                    result.add_file_error(
-                        str(file_path), f"File too large: {file_size} bytes"
-                    )
+                # Check file size
+                file_stat = await anyio.to_thread.run_sync(file_path.stat)
+                if file_stat.st_size > max_file_size:
+                    result.add_error(str(file_path), "File too large")
                     continue
+
+                # Count this file as searched
+                result.files_searched += 1
 
                 # Read file content
                 try:
                     content = await anyio.to_thread.run_sync(
-                        partial(file_path.read_text, encoding="utf-8", errors="replace")
+                        file_path.read_text, encoding="utf-8", errors="replace"
                     )
                 except UnicodeDecodeError:
-                    result.add_file_error(str(file_path), "Binary file")
+                    # Skip binary files
+                    result.add_error(str(file_path), "Binary file")
                     continue
 
-                # Split into lines and preserve line endings
-                lines_with_endings = []
-                start = 0
-                for i, c in enumerate(content):
-                    if c == "\n":
-                        lines_with_endings.append(content[start : i + 1])
-                        start = i + 1
-
-                if start < len(content):
-                    lines_with_endings.append(content[start:])
-
-                # Strip line endings for matching
-                lines = [line.rstrip("\n\r") for line in lines_with_endings]
-
-                # Search for pattern in each line
+                lines = content.splitlines()
                 file_matches = 0
 
-                for line_number, line in enumerate(lines, 1):
-                    # Skip binary files (lines with null bytes)
-                    if "\0" in line:
-                        result.add_file_error(str(file_path), "Binary file")
+                # Search each line
+                for line_num, line in enumerate(lines, 1):
+                    if result.total_matches >= max_results:
                         break
 
+                    search_line = line if case_sensitive else line.lower()
+
                     if is_regex:
-                        # Use regex search
-                        for match in compiled_pattern.finditer(line):
-                            match_start, match_end = match.span()
-
-                            # Skip if count only
-                            if count_only:
-                                file_matches += 1
-                                continue
-
-                            # Get context lines
-                            context_before_lines: List[str] = []
-                            context_after_lines: List[str] = []
-
-                            # Determine how many lines to show before/after
-                            before_lines = (
-                                context_before if context_before > 0 else context_lines
-                            )
-                            after_lines = (
-                                context_after if context_after > 0 else context_lines
-                            )
-
-                            # Get context before match
-                            for ctx_line_num in range(
-                                max(1, line_number - before_lines), line_number
-                            ):
-                                context_before_lines.append(lines[ctx_line_num - 1])
-
-                            # Get context after match
-                            for ctx_line_num in range(
-                                line_number + 1,
-                                min(len(lines) + 1, line_number + after_lines + 1),
-                            ):
-                                context_after_lines.append(lines[ctx_line_num - 1])
-
-                            match_obj = GrepMatch(
-                                file_path=str(file_path),
-                                line_number=line_number,
-                                line_content=line,
-                                match_start=match_start,
-                                match_end=match_end,
-                                context_before=context_before_lines,
-                                context_after=context_after_lines,
-                            )
-
-                            result.add_match(match_obj)
-
-                            if result.total_matches >= max_results:
-                                break
-                    else:
-                        # Use string search
-                        search_line = line.lower() if not case_sensitive else line
-                        search_pattern = (
-                            pattern.lower() if not case_sensitive else pattern
-                        )
-
-                        start_pos = 0
-                        while start_pos <= len(search_line) - len(search_pattern):
-                            match_pos = search_line.find(search_pattern, start_pos)
-                            if match_pos == -1:
-                                break
-
-                            match_end = match_pos + len(search_pattern)
-
-                            # Check if it's a whole word
-                            if not whole_word or is_whole_word(
-                                search_line, match_pos, match_end
-                            ):
-                                # Skip if count only
-                                if count_only:
-                                    file_matches += 1
-                                else:
+                        # Use compiled regex with timeout protection
+                        try:
+                            matches = await self._safe_regex_operation(compiled_pattern.finditer, search_line)
+                            for match in matches:
+                                if is_whole_word(line, match.start(), match.end()):
                                     # Get context lines
                                     context_before_lines = []
                                     context_after_lines = []
 
-                                    # Determine how many lines to show before
-                                    before_lines = (
+                                    # Context before
+                                    before_count = (
                                         context_before
                                         if context_before > 0
                                         else context_lines
                                     )
+                                    for i in range(
+                                        max(0, line_num - 1 - before_count),
+                                        line_num - 1,
+                                    ):
+                                        context_before_lines.append(lines[i])
 
-                                    # Determine how many lines to show after
-                                    after_lines = (
-                                        context_after
-                                        if context_after > 0
-                                        else context_lines
+                                    # Context after
+                                    after_count = (
+                                        context_after if context_after > 0 else context_lines
                                     )
-
-                                    # Get context before the match
-                                    for ctx_line_num in range(
-                                        max(1, line_number - before_lines), line_number
+                                    for i in range(
+                                        line_num,
+                                        min(len(lines), line_num + after_count),
                                     ):
-                                        context_before_lines.append(
-                                            lines[ctx_line_num - 1]
-                                        )
+                                        context_after_lines.append(lines[i])
 
-                                    # Get context after the match
-                                    for ctx_line_num in range(
-                                        line_number + 1,
-                                        min(
-                                            len(lines) + 1,
-                                            line_number + after_lines + 1,
-                                        ),
-                                    ):
-                                        context_after_lines.append(
-                                            lines[ctx_line_num - 1]
-                                        )
-
-                                    match_obj = GrepMatch(
+                                    grep_match = GrepMatch(
                                         file_path=str(file_path),
-                                        line_number=line_number,
+                                        line_number=line_num,
                                         line_content=line,
-                                        match_start=match_pos,
-                                        match_end=match_end,
+                                        match_start=match.start(),
+                                        match_end=match.end(),
                                         context_before=context_before_lines,
                                         context_after=context_after_lines,
                                     )
 
-                                    result.add_match(match_obj)
+                                    if not count_only:
+                                        result.add_match(grep_match)
+                                    file_matches += 1
 
                                     if result.total_matches >= max_results:
                                         break
+                        except ValueError as e:
+                            if "timed out" in str(e):
+                                result.add_error(str(file_path), f"Regex timeout: {e}")
+                                continue
+                            else:
+                                raise
+                    else:
+                        # Simple string search
+                        start = 0
+                        while True:
+                            pos = search_line.find(pattern, start)
+                            if pos == -1:
+                                break
 
-                            start_pos = match_end
+                            end_pos = pos + len(pattern)
+                            if is_whole_word(line, pos, end_pos):
+                                # Get context lines
+                                context_before_lines = []
+                                context_after_lines = []
 
-                    if result.total_matches >= max_results:
-                        break
+                                # Context before
+                                before_count = (
+                                    context_before
+                                    if context_before > 0
+                                    else context_lines
+                                )
+                                for i in range(
+                                    max(0, line_num - 1 - before_count),
+                                    line_num - 1,
+                                ):
+                                    context_before_lines.append(lines[i])
 
-                # Update file counts for count-only mode
-                if count_only and file_matches > 0:
+                                # Context after
+                                after_count = (
+                                    context_after if context_after > 0 else context_lines
+                                )
+                                for i in range(
+                                    line_num,
+                                    min(len(lines), line_num + after_count),
+                                ):
+                                    context_after_lines.append(lines[i])
+
+                                grep_match = GrepMatch(
+                                    file_path=str(file_path),
+                                    line_number=line_num,
+                                    line_content=line,
+                                    match_start=pos,
+                                    match_end=end_pos,
+                                    context_before=context_before_lines,
+                                    context_after=context_after_lines,
+                                )
+
+                                if not count_only:
+                                    result.add_match(grep_match)
+                                file_matches += 1
+
+                                if result.total_matches >= max_results:
+                                    break
+
+                            start = pos + 1
+
+                            if result.total_matches >= max_results:
+                                break
+
+                # Update file count if we had matches
+                if file_matches > 0:
                     result.file_counts[str(file_path)] = file_matches
-                    result.total_matches += file_matches
-
-                result.increment_files_searched()
-
-                if result.total_matches >= max_results:
-                    break
 
             except (PermissionError, FileNotFoundError) as e:
-                result.add_file_error(str(file_path), str(e))
-                continue
-            except Exception as e:
-                result.add_file_error(str(file_path), f"Error: {str(e)}")
-                continue
+                result.add_error(str(file_path), str(e))
 
-        if show_progress and progress_callback:
-            await progress_callback(total_files, total_files)
+            # Update progress
+            processed += 1
+            if show_progress and progress_callback:
+                progress_callback(processed, total_files)
 
-        # Apply results pagination if requested
+        # Apply pagination if requested
         if results_offset > 0 or results_limit is not None:
-            # Create a new result with the same metadata
             paginated_result = GrepResult()
+            paginated_result.file_counts = result.file_counts
+            paginated_result.total_matches = result.total_matches
             paginated_result.files_searched = result.files_searched
-            paginated_result.total_matches = (
-                result.total_matches
-            )  # Keep the true total for metadata
-            paginated_result.file_counts = result.file_counts.copy()
-            paginated_result.errors = result.errors.copy()
+            paginated_result.errors = result.errors
 
-            # Calculate the effective range
+            # Apply offset and limit
             start_idx = min(results_offset, len(result.matches))
 
             if results_limit is not None:
@@ -952,3 +857,63 @@ class GrepTools:
             return paginated_result
 
         return result
+
+    def _validate_regex_security(self, pattern: str) -> None:
+        """Validate regex patterns to prevent ReDoS attacks.
+        
+        Args:
+            pattern: Regex pattern to validate
+            
+        Raises:
+            ValueError: If pattern is potentially dangerous
+        """
+        # Check pattern length
+        if len(pattern) > MAX_REGEX_LENGTH:
+            raise ValueError(f"Regex pattern too long (max {MAX_REGEX_LENGTH} characters)")
+        
+        # Block dangerous patterns that can cause exponential backtracking
+        dangerous_patterns = [
+            r'(.*)*',      # Nested quantifiers
+            r'(.+)+',      # Nested quantifiers  
+            r'(a+)+',      # Nested quantifiers
+            r'(a*)*',      # Nested quantifiers
+            r'(a+)*',      # Nested quantifiers
+            r'(a|a)*',     # Alternation with overlap
+            r'([a-z]+)+',  # Character class with nested quantifiers
+            r'(\w+)+',     # Word boundary with nested quantifiers
+        ]
+        
+        for dangerous in dangerous_patterns:
+            if dangerous in pattern:
+                raise ValueError(f"Potentially dangerous regex pattern detected: {dangerous}")
+        
+        # Count nested quantifiers and alternations
+        quantifier_count = pattern.count('+') + pattern.count('*') + pattern.count('?')
+        if quantifier_count > 10:
+            raise ValueError("Too many quantifiers in regex pattern (max 10)")
+            
+        alternation_count = pattern.count('|')
+        if alternation_count > 20:
+            raise ValueError("Too many alternations in regex pattern (max 20)")
+    
+    async def _safe_regex_operation(self, operation, *args, **kwargs):
+        """Execute regex operation with timeout protection.
+        
+        Args:
+            operation: Function to execute
+            *args: Arguments for the operation
+            **kwargs: Keyword arguments for the operation
+            
+        Returns:
+            Result of the operation
+            
+        Raises:
+            asyncio.TimeoutError: If operation times out
+        """
+        try:
+            return await asyncio.wait_for(
+                anyio.to_thread.run_sync(operation, *args, **kwargs),
+                timeout=REGEX_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            raise ValueError(f"Regex operation timed out after {REGEX_TIMEOUT_SECONDS} seconds - possible ReDoS attack")

@@ -6,6 +6,7 @@ to ensure that all file operations are restricted to allowed directories.
 
 import platform
 import re
+import urllib.parse
 from pathlib import Path
 from typing import List, Optional, Set, Tuple, Union
 
@@ -70,6 +71,89 @@ class PathValidator:
             return path.lower()
         return path
 
+    def _decode_path_safely(self, requested_path: str) -> str:
+        """Safely decode URL-encoded paths to prevent encoding bypass attacks.
+        
+        Args:
+            requested_path: Raw path that may contain URL encoding
+            
+        Returns:
+            Decoded path
+        """
+        try:
+            # Decode URL encoding (e.g., %2e%2e%2f -> ../)
+            decoded = urllib.parse.unquote(requested_path)
+            
+            # Additional decoding for double-encoded attempts
+            if '%' in decoded:
+                decoded = urllib.parse.unquote(decoded)
+                
+            return decoded
+        except Exception:
+            # If decoding fails, return original path
+            return requested_path
+    
+    async def _validate_path_security(self, requested_path: str) -> bool:
+        """Pre-validation security checks to prevent path traversal attacks.
+        
+        Args:
+            requested_path: Raw user input path to validate
+            
+        Returns:
+            True if path passes security checks, False otherwise
+        """
+        # SECURITY FIX: Decode path before validation to prevent encoding bypass
+        decoded_path = self._decode_path_safely(requested_path)
+        
+        # Block null bytes (can bypass security checks in some filesystems)
+        if '\x00' in requested_path or '\x00' in decoded_path:
+            logger.warning(f"Path contains null byte: {requested_path}")
+            return False
+            
+        # Block obvious traversal attempts before path resolution (check both original and decoded)
+        if '..' in requested_path or '..' in decoded_path:
+            logger.warning(f"Path traversal attempt detected: {requested_path} (decoded: {decoded_path})")
+            return False
+            
+        # Block suspicious patterns (check both original and decoded paths)
+        suspicious_patterns = [
+            '/../',
+            '/./',
+            '\\..\\',
+            '\\',
+            '//',
+            '\\/',
+            # Additional encoded patterns
+            '%2e%2e%2f',
+            '%2e%2e%5c',
+            '..%2f',
+            '..%5c',
+        ]
+        
+        for pattern in suspicious_patterns:
+            if pattern in requested_path or pattern in decoded_path:
+                logger.warning(f"Suspicious path pattern detected: {pattern} in {requested_path} (decoded: {decoded_path})")
+                return False
+                
+        # Limit path length to prevent buffer overflow attacks (check both paths)
+        if len(requested_path) > 4096 or len(decoded_path) > 4096:
+            logger.warning(f"Path too long: {len(requested_path)} characters (decoded: {len(decoded_path)})")
+            return False
+            
+        # Block absolute paths that don't start with allowed prefixes
+        if Path(requested_path).is_absolute():
+            allowed = False
+            for allowed_dir in self.allowed_dirs:
+                clean_allowed = allowed_dir.rstrip('/')
+                if requested_path.startswith(clean_allowed):
+                    allowed = True
+                    break
+            if not allowed:
+                logger.warning(f"Absolute path outside allowed directories: {requested_path}")
+                return False
+                
+        return True
+
     async def validate_path(
         self, requested_path: Union[str, Path]
     ) -> Tuple[Path, bool]:
@@ -85,7 +169,15 @@ class PathValidator:
             ValueError: If path is invalid or outside allowed directories
         """
         try:
-            # Convert to absolute path
+            # SECURITY: Pre-validation before path resolution to prevent traversal attacks
+            if not await self._validate_path_security(str(requested_path)):
+                logger.warning(
+                    f"Path validation failed security check: {requested_path}",
+                    extra={"path": str(requested_path)},
+                )
+                return Path(requested_path), False
+
+            # Convert to absolute path after security validation
             abs_path = Path(requested_path).expanduser().resolve()
             normalized = self._normalize_case(str(abs_path))
 
