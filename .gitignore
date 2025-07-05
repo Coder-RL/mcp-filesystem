@@ -21,3 +21,7 @@ docs/**
 # AI conversation artifacts
 context/**
 AI_CHANGELOG.md
+
+# Log files
+*.log
+server_output.log
